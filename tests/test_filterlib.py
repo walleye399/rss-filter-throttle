@@ -4,7 +4,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 from filterlib import Msg, evaluate_chain, parse_dat
 from imaputil import utf7_encode
-from annotate import annotate_raw
+from annotate import annotate_raw, find_link, pick_link
 import email, email.header
 
 rules = parse_dat((ROOT / "tests/fixtures/sample.dat").read_text(encoding="utf-8"))
@@ -26,4 +26,25 @@ assert utf7_encode("INBOX") == "INBOX" and utf7_encode("A&B") == "A&-B"
 raw = b"From: a@x\r\nSubject: =?utf-8?b?44OG44K544OI?=\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nhello"
 m = email.message_from_bytes(annotate_raw(raw, "R：x | y"))
 assert "【除外理由】R：x | y" in m.get_payload(decode=True).decode() and m["X-Exclusion-Reason"]
+# ---- リンク帯 ----
+H = lambda body: ("<html><body>" + body + "</body></html>")
+assert pick_link(H('<a href="https://ex.com/top">トップ</a><a href="https://ex.com/web?id=1">ブラウザで表示</a>')) == "https://ex.com/web?id=1"
+assert pick_link(H('<a href="https://ex.com/unsub">配信停止</a><a href="https://ex.com/a?x=1&amp;y=2">記事はこちら</a>')) == "https://ex.com/a?x=1&y=2"
+assert pick_link(H('<a href="https://ex.com/v">View in browser</a>')) == "https://ex.com/v"
+assert pick_link(H('<a href="mailto:a@b.c">連絡</a><a href="https://ex.com/unsubscribe">x</a>')) is None
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+mp = MIMEMultipart("alternative"); mp["Subject"] = "件名"; mp["From"] = "a@x"
+mp.attach(MIMEText("本文", "plain", "utf-8"))
+mp.attach(MIMEText(H('<a href="https://ex.com/web">ブラウザで見る</a><p>本文</p>'), "html", "utf-8"))
+raw = mp.as_bytes()
+assert find_link(raw) == "https://ex.com/web"
+assert find_link(MIMEText("text only https://ex.com", "plain", "utf-8").as_bytes()) is None
+out = email.message_from_bytes(annotate_raw(raw, None, "ニュースレター 11月号", "https://ex.com/web"))
+htmls = [p for p in out.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
+assert 'href="https://ex.com/web" style="display:inline-block;background:#2b3a55;color:#ffffff' in htmls and "ニュースレター 11月号" in htmls
+assert "X-Exclusion-Reason" not in out and "【除外理由】" not in htmls            # 理由なし(残すメール)
+out = email.message_from_bytes(annotate_raw(raw, "R：x", "件名", "https://ex.com/web"))
+htmls = [p for p in out.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
+assert htmls.index("【除外理由】R：x") < htmls.index("background:#2b3a55")          # 理由 → リンク帯の順
 print("OK: all tests passed")
