@@ -243,7 +243,7 @@ def run_rss(cfg, mb, state):
                         # 日付は付けない = 追加した時刻が保管期限の起点になる
                         mb.im.append(mb.q(r["folder"]), r"(\Seen)", None, m.as_bytes())
                     stats["reject"] += 1
-                    log(f"- 🚫 [{ftitle}] {title} → {r['folder']} ← {r['reason']}")
+                    log(f"- 🚫 [{ftitle}] {title} → {r['folder']} ← {r['reason']} (フィルタ{r['tag']})")
                 done.append(eid)
             except Exception as ex_:
                 stats["err"] += 1
@@ -308,7 +308,7 @@ def run_mail(cfg, mb):
                     changed = True
             else:
                 stats["reject"] += 1
-                log(f"- 🚫 {frm} / {subj} → {r['folder']} ← {r['reason']}")
+                log(f"- 🚫 {frm} / {subj} → {r['folder']} ← {r['reason']} (フィルタ{r['tag']})")
                 if not DRY:
                     try:
                         new_raw = annotate_raw(raw, r["reason"])

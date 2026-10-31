@@ -140,6 +140,16 @@ def describe_hit(term, matched=None) -> str:
     }[op]
 
 
+def hit_keyword(term, matched=None) -> str:
+    """除外理由に載せる、一致したキーワード(正規表現なら実際に一致した文字列)。"""
+    f, op, v = term["field"], term["op"], term["value"]
+    if f in REGEX_FIELDS:
+        kw = matched if (op == "matches" and matched) else "!" + v
+    else:
+        kw = v if op not in ("doesn't contain", "isn't") else "!" + v
+    return kw if len(kw) <= 40 else kw[:39] + "…"
+
+
 def evaluate_detail(rules, msg: Msg, icase=False):
     """1つのルール集合を上から評価。-> dict(result, rule, label, hits[説明文])"""
     for r in rules:
@@ -152,7 +162,7 @@ def evaluate_detail(rules, msg: Msg, icase=False):
             for t in r["terms"]:
                 ok, mt = _term_hit(t, msg, icase)
                 if ok:
-                    hits = [describe_hit(t, mt)]
+                    hits = [hit_keyword(t, mt)]
                     break
             matched = bool(hits)
         else:  # all
@@ -162,7 +172,7 @@ def evaluate_detail(rules, msg: Msg, icase=False):
                 if not ok:
                     matched = False
                     break
-                hits.append(describe_hit(t, mt))
+                hits.append(hit_keyword(t, mt))
         if matched:
             return {"result": r["result"], "rule": r["name"], "label": r["label"], "hits": hits}
     return {"result": "keep", "rule": None, "label": None, "hits": []}
@@ -183,6 +193,6 @@ def evaluate_chain(rulesets, msg: Msg, icase=False):
         if d["result"] == "reject":
             d["tag"] = rs["tag"]
             d["folder"] = rs.get("by_label", {}).get(d["label"], rs["default_reject"])
-            d["reason"] = f"フィルタ{rs['tag']}「{d['rule']}」: " + " かつ ".join(d["hits"])
+            d["reason"] = f"{d['rule']}：" + " | ".join(d["hits"])
             return d
     return {"result": "keep", "folder": None, "reason": "", "tag": None, "rule": None, "hits": []}
