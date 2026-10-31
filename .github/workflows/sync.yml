@@ -1,0 +1,70 @@
+name: sync
+
+# このリポジトリはプログラムだけを置く公開リポジトリです。
+# ルール・feeds.txt・状態・詳細ログは、Secrets DATA_REPO で指定した非公開リポジトリにあります。
+# 定期実行は GAS(gas/Code.gs)が workflow_dispatch API で起動します。
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "DRY RUN（メールボックスへの書き込み・削除・状態更新なし）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout data repo (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.DATA_REPO }}
+          token: ${{ secrets.DATA_TOKEN }}
+          path: data
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Prepare config
+        run: test -f data/config.json || cp config.example.json data/config.json
+
+      - name: Run
+        env:
+          DATA_DIR: ${{ github.workspace }}/data
+          QUIET_LOG: "1"   # 公開ログには件数だけ。詳細は data/logs/last_run.md(非公開)
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASS: ${{ secrets.IMAP_PASS }}
+        run: python src/run.py
+
+      - name: Commit state and log to data repo
+        if: ${{ always() }}
+        working-directory: data
+        env:
+          DRYRUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ "$DRYRUN" != "true" ] && git add state/state.json 2>/dev/null
+          # 状態が変わった時(または dry-run の時)だけログもコミットして、コミット数を抑える
+          if [ "$DRYRUN" = "true" ] || ! git diff --cached --quiet; then git add logs/last_run.md 2>/dev/null; fi
+          if ! git diff --cached --quiet; then
+            git commit -q -m "update state"
+            for i in 1 2 3; do git pull -q --rebase && git push -q && break; sleep 5; done
+          fi
+          true

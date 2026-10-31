@@ -1,0 +1,4 @@
+config.test.json
+__pycache__/
+*.pyc
+logs/
