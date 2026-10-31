@@ -29,7 +29,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import imaputil  # noqa: E402
-from annotate import annotate_raw, banner  # noqa: E402
+from annotate import LINK_STYLE, REASON_STYLE, annotate_raw, banner, find_link  # noqa: E402
 from filterlib import Msg, evaluate_chain  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent          # プログラム(公開リポジトリ)
@@ -170,13 +170,10 @@ def build_rss_message(e, feed_title, link, reason=None):
     if reason:
         m["X-Exclusion-Reason"] = reason
         pre_t = f"{banner(reason)}\n{'-' * 30}\n\n"
-        pre_h = ('<div style="background:#fff3cd;border:1px solid #e0c36a;padding:6px 10px;'
-                 'margin:0 0 12px;font:13px sans-serif;color:#5c4a00">'
-                 + html.escape(banner(reason)) + "</div>")
+        pre_h = f'<div style="{REASON_STYLE}">' + html.escape(banner(reason)) + "</div>"
     m.set_content(pre_t + strip_html(content) + (f"\n\n{link}" if link else ""))
     # タイトルのリンク: 白文字・濃い帯・文字サイズ +3pt（calc未対応のクライアントは 1.3em にフォールバック）
-    link_style = ("display:inline-block;background:#2b3a55;color:#ffffff;text-decoration:none;"
-                  "font-size:1.3em;font-size:calc(1em + 3pt);padding:4px 10px;border-radius:4px")
+    link_style = LINK_STYLE
     m.add_alternative(f'{pre_h}<p><a href="{html.escape(link or "")}" style="{link_style}">'
                       f'<font color="#ffffff">{html.escape(title)}</font></a></p>{content}',
                       subtype="html")
@@ -272,11 +269,18 @@ def run_mail(cfg, mb):
     changed = False
     for u in uids:
         uid = u.decode()
-        typ, d = im.uid("FETCH", uid, "(BODY.PEEK[])")
+        typ, d = im.uid("FETCH", uid, "(FLAGS INTERNALDATE BODY.PEEK[])")
         if typ != "OK" or not d or not isinstance(d[0], tuple):
             stats["err"] += 1
             continue
         raw = d[0][1]
+        meta = d[0][0].decode("ascii", "replace") + " " + " ".join(
+            x.decode("ascii", "replace") for x in d[1:] if isinstance(x, bytes))
+        fm = re.search(r"FLAGS \(([^)]*)\)", meta)
+        dm = re.search(r'INTERNALDATE "([^"]+)"', meta)
+        flags = [f for f in (fm.group(1).split() if fm else []) if f.lower() not in ("\\recent", "\\deleted")]
+        flag_str = "(" + " ".join(flags) + ")" if flags else None
+        idate = f'"{dm.group(1)}"' if dm else None
         m = email.message_from_bytes(raw)
         subj, frm = dh(m["Subject"]), dh(m["From"])
 
@@ -296,14 +300,21 @@ def run_mail(cfg, mb):
             return "\n".join(texts)
 
         r = evaluate_chain(rulesets, Msg(subject=subj, from_=frm, body=body_fn), icase)
+        url = find_link(raw)  # 本文中の「ブラウザで見る」系リンク(無ければ最初のリンク)
         try:
             if r["result"] == "keep":
                 stats["keep"] += 1
-                log(f"- ✅ {frm} / {subj}")
+                log(f"- ✅ {frm} / {subj}" + (f"\n  🔗 {url}" if url else ""))
                 if not DRY:
-                    typ, _ = im.uid("COPY", uid, mb.q(keep_folder))  # フラグ(未読)は保持される
-                    if typ != "OK":
-                        raise RuntimeError("COPY失敗")
+                    if url:  # 青い帯のリンクを入れて入れ直す(未読などのフラグ・受信日時は引き継ぐ)
+                        typ, _ = im.append(mb.q(keep_folder), flag_str, idate,
+                                           annotate_raw(raw, subject=subj, url=url))
+                        if typ != "OK":
+                            raise RuntimeError("APPEND失敗")
+                    else:
+                        typ, _ = im.uid("COPY", uid, mb.q(keep_folder))  # フラグ(未読)は保持される
+                        if typ != "OK":
+                            raise RuntimeError("COPY失敗")
                     im.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
                     changed = True
             else:
@@ -311,7 +322,7 @@ def run_mail(cfg, mb):
                 log(f"- 🚫 {frm} / {subj} → {r['folder']} ← {r['reason']} (フィルタ{r['tag']})")
                 if not DRY:
                     try:
-                        new_raw = annotate_raw(raw, r["reason"])
+                        new_raw = annotate_raw(raw, r["reason"], subj, url)
                     except Exception as ex_:  # 埋め込み失敗時はヘッダー追記だけで保存
                         log(f"  (本文への理由埋め込みに失敗: {ex_!r})")
                         hdr = "X-Exclusion-Reason: " + str(email.header.Header(r["reason"], "utf-8")) + "\r\n"
