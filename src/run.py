@@ -345,6 +345,23 @@ def run_purge(cfg, mb):
             log(f"- ⚠ {f}: 失敗 {e!r}")
             if QUIET:
                 pub(f"- ⚠ {f}: 失敗 ({type(e).__name__})")
+    # ゴミ箱: 受信日時が trash_retention_hours 時間より古いものを削除（0 / null で無効）
+    th = cfg.get("trash_retention_hours", 24)
+    if th:
+        try:
+            real = mb.find_trash(cfg.get("trash_folder"))
+            protected = {"INBOX", mb.name(cfg["processed_folder"]), *(mb.name(f) for f in folders)}
+            if real is None:
+                pub("- ⚠ ゴミ箱フォルダが見つかりません（config.json の trash_folder で指定してください）")
+            elif real in protected:
+                pub("- ⚠ ゴミ箱に指定されたフォルダが受信箱・処理済み・除外フォルダと同じです。削除しません")
+            else:
+                n = imaputil.purge_real(mb, real, th, dry=DRY)
+                pub(f"- ゴミ箱({real}): {n}件（{th}時間より古いもの）" + (" (DRY RUN: 削除せず)" if DRY and n else ""))
+        except Exception as e:
+            log(f"- ⚠ ゴミ箱: 失敗 {e!r}")
+            if QUIET:
+                pub(f"- ⚠ ゴミ箱: 失敗 ({type(e).__name__})")
 
 
 # ---------------------------------------------------------------- main

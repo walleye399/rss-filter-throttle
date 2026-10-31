@@ -50,6 +50,7 @@ class Mailbox:
     def __init__(self, im, dry=False):
         self.im, self.dry, self.cache = im, dry, {}
         self.existing = set()
+        self.trash_attr = None  # LISTで \\Trash 属性が付いていたフォルダ(実名)
         self.sep = "."
         typ, data = im.list()
         for line in data or []:
@@ -60,7 +61,10 @@ class Mailbox:
                 continue
             if m.group(2):
                 self.sep = m.group(2).decode()
-            self.existing.add(m.group(3).decode("ascii", "replace").strip('"'))
+            real = m.group(3).decode("ascii", "replace").strip('"')
+            self.existing.add(real)
+            if b"\\trash" in m.group(1).lower():
+                self.trash_attr = real
 
     def name(self, logical: str) -> str:
         if logical.upper() == "INBOX":
@@ -90,6 +94,26 @@ class Mailbox:
     def q(self, logical: str) -> str:
         return '"' + self.name(logical) + '"'
 
+    TRASH_NAMES = ["Trash", "Deleted Items", "Deleted Messages", "ごみ箱", "ゴミ箱"]
+
+    def find_trash(self, configured=None):
+        """ゴミ箱の実フォルダ名を返す(作成はしない)。指定 → \\Trash属性 → 一般的な名前、の順に探す。無ければ None。"""
+        names = ([configured] if configured else [])
+        cands = []
+        for n in names:
+            e = utf7_encode(n)
+            cands += [e, "INBOX" + self.sep + e]
+        if configured:
+            return next((c for c in cands if c in self.existing), None)
+        if self.trash_attr:
+            return self.trash_attr
+        for n in self.TRASH_NAMES:
+            e = utf7_encode(n)
+            for c in (e, "INBOX" + self.sep + e):
+                if c in self.existing:
+                    return c
+        return None
+
 
 def _chunks(seq, n):
     for i in range(0, len(seq), n):
@@ -98,8 +122,16 @@ def _chunks(seq, n):
 
 def purge_older_than(mb: Mailbox, logical: str, hours: float, dry=False):
     """INTERNALDATE が hours 時間より古いメッセージを削除。-> (対象数)"""
-    im = mb.im
-    typ, _ = im.select(mb.q(logical), readonly=dry)
+    return _purge(mb.im, mb.q(logical), hours, dry)
+
+
+def purge_real(mb: Mailbox, real_name: str, hours: float, dry=False):
+    """実フォルダ名(サーバー上の名前そのまま)を指定して、古いメッセージを削除。"""
+    return _purge(mb.im, '"' + real_name + '"', hours, dry)
+
+
+def _purge(im, quoted: str, hours: float, dry=False):
+    typ, _ = im.select(quoted, readonly=dry)
     if typ != "OK":
         return 0
     typ, data = im.uid("SEARCH", None, "ALL")
