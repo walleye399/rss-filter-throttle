@@ -42,9 +42,26 @@ assert find_link(raw) == "https://ex.com/web"
 assert find_link(MIMEText("text only https://ex.com", "plain", "utf-8").as_bytes()) is None
 out = email.message_from_bytes(annotate_raw(raw, None, "ニュースレター 11月号", "https://ex.com/web"))
 htmls = [p for p in out.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
-assert 'href="https://ex.com/web" style="display:inline-block;background:#2b3a55;color:#ffffff' in htmls and "ニュースレター 11月号" in htmls
+assert 'class="tbband" style="display:inline-block;background:#2b3a55;color:#ffffff' in htmls and "ニュースレター 11月号" in htmls
 assert "X-Exclusion-Reason" not in out and "【除外理由】" not in htmls            # 理由なし(残すメール)
 out = email.message_from_bytes(annotate_raw(raw, "R：x", "件名", "https://ex.com/web"))
 htmls = [p for p in out.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
 assert htmls.index("【除外理由】R：x") < htmls.index("background:#2b3a55")          # 理由 → リンク帯の順
+# ---- 暗い背景 ----
+import annotate
+dh = annotate.dark_head
+assert "@media (prefers-color-scheme: dark)" in dh("auto") and "color-scheme" in dh("auto")
+assert "@media" not in dh("always") and "background-color:#000" in dh("always") and dh("off") == ""
+annotate.DARK_MODE = "auto"
+out = email.message_from_bytes(annotate_raw(raw))      # 理由もリンクも無い=暗い背景のCSSだけ
+htmls = [p for p in out.walk() if p.get_content_type() == "text/html"][0].get_payload(decode=True).decode()
+assert "prefers-color-scheme: dark" in htmls and htmls.index("<style>") < htmls.index("</head>") if "</head>" in htmls else True
+src = H("<p>x</p>").replace("<html>", "<html><head><title>t</title></head>")
+o = email.message_from_bytes(annotate_raw(MIMEText(src, "html", "utf-8").as_bytes()))
+h2 = o.get_payload(decode=True).decode()
+assert h2.index("<style>") < h2.index("</head>") and h2.index("</head>") < h2.index("<body>"), h2[:200]
+annotate.DARK_MODE = "off"
+o = email.message_from_bytes(annotate_raw(MIMEText(src, "html", "utf-8").as_bytes()))
+assert "<style>" not in o.get_payload(decode=True).decode()
+annotate.DARK_MODE = "auto"
 print("OK: all tests passed")
