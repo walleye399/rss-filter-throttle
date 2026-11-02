@@ -20,6 +20,43 @@ BROWSER_RE = re.compile(r"ブラウザ|ウェブ版|web版|webで|view\s+(this\s
 SKIP_RE = re.compile(r"配信停止|配信解除|購読解除|解除|unsubscribe|opt[- ]?out|email\s*preferences|メール配信設定", re.I)
 
 
+DARK_MODE = "auto"  # auto: ダークモードの時だけ暗くする / always: 常に暗くする / off: 何もしない
+
+_DARK_RULES = (
+    "html,body,table,thead,tbody,tfoot,tr,td,th,div,section,article,header,footer,center,p,span,li,ul,ol,"
+    "h1,h2,h3,h4,h5,h6,blockquote,pre,code,font,strong,em,b,i,u,small"
+    "{background-color:#000 !important;color:#e8e8e8 !important}"
+    "a{color:#8ab4f8 !important}img{background-color:transparent !important}"
+    ".tbreason{background-color:#3a3320 !important;color:#f3e3a0 !important;border-color:#8a7a3a !important}"
+    "a.tbband,a.tbband *{color:#ffffff !important}a.tbband{background-color:#2b3a55 !important}"
+    "a.tbband *{background-color:transparent !important}"
+)
+
+
+def dark_head(mode=None) -> str:
+    """HTMLメールを暗い背景にするための <meta>/<style>。Macの「メッセージの背景を暗くする」でも
+    本文が白のままになる(明るい背景を指定したHTMLメール)のを防ぐ。"""
+    mode = mode or DARK_MODE
+    if mode == "off":
+        return ""
+    css = _DARK_RULES if mode == "always" else "@media (prefers-color-scheme: dark){" + _DARK_RULES + "}"
+    return ('<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark">'
+            "<style>:root{color-scheme:light dark}" + css + "</style>")
+
+
+def _inject_head(t: str, head: str) -> str:
+    for pat in (r"(</head\s*>)", r"(<head[^>]*>)", r"(<html[^>]*>)"):
+        new, n = re.subn(pat, lambda m: (head + m.group(1)) if "/" in m.group(1)[:3] else (m.group(1) + head), t, count=1, flags=re.I)
+        if n:
+            return new
+    return head + t
+
+
+def has_html(raw: bytes) -> bool:
+    msg = email.message_from_bytes(raw)
+    return any(p.get_content_type() == "text/html" and p.get_content_disposition() != "attachment" for p in msg.walk())
+
+
 def banner(reason: str) -> str:
     return f"【除外理由】{reason}"
 
@@ -84,9 +121,9 @@ def annotate_raw(raw: bytes, reason=None, subject=None, url=None) -> bytes:
         msg["X-Exclusion-Reason"] = email.header.Header(reason, "utf-8")
     html_pre = ""
     if reason:
-        html_pre += f'<div style="{REASON_STYLE}">{html.escape(banner(reason))}</div>'
+        html_pre += f'<div class="tbreason" style="{REASON_STYLE}">{html.escape(banner(reason))}</div>'
     if subject and url:
-        html_pre += (f'<p><a href="{html.escape(url)}" style="{LINK_STYLE}">'
+        html_pre += (f'<p><a href="{html.escape(url)}" class="tbband" style="{LINK_STYLE}">'
                      f'<font color="#ffffff">{html.escape(subject or "(無題)")}</font></a></p>')
     for part in msg.walk():
         if part.is_multipart() or part.get_content_disposition() == "attachment":
@@ -94,11 +131,13 @@ def annotate_raw(raw: bytes, reason=None, subject=None, url=None) -> bytes:
         ct = part.get_content_type()
         if ct == "text/plain" and reason:
             new = f"{banner(reason)}\n{'-' * 30}\n\n{_decode(part)}"
-        elif ct == "text/html" and html_pre:
+        elif ct == "text/html" and (html_pre or dark_head()):
             t = _decode(part)
             new, n = re.subn(r"(<body[^>]*>)", lambda m: m.group(1) + html_pre, t, count=1, flags=re.I)
             if not n:
                 new = html_pre + t
+            if dark_head():
+                new = _inject_head(new, dark_head())
         else:
             continue
         del part["Content-Transfer-Encoding"]

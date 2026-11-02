@@ -29,7 +29,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import imaputil  # noqa: E402
-from annotate import LINK_STYLE, REASON_STYLE, annotate_raw, banner, find_link  # noqa: E402
+import annotate  # noqa: E402
+from annotate import LINK_STYLE, REASON_STYLE, annotate_raw, banner, dark_head, find_link, has_html  # noqa: E402
 from filterlib import Msg, evaluate_chain  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent          # プログラム(公開リポジトリ)
@@ -170,11 +171,11 @@ def build_rss_message(e, feed_title, link, reason=None):
     if reason:
         m["X-Exclusion-Reason"] = reason
         pre_t = f"{banner(reason)}\n{'-' * 30}\n\n"
-        pre_h = f'<div style="{REASON_STYLE}">' + html.escape(banner(reason)) + "</div>"
+        pre_h = f'<div class="tbreason" style="{REASON_STYLE}">' + html.escape(banner(reason)) + "</div>"
     m.set_content(pre_t + strip_html(content) + (f"\n\n{link}" if link else ""))
     # タイトルのリンク: 白文字・濃い帯・文字サイズ +3pt（calc未対応のクライアントは 1.3em にフォールバック）
     link_style = LINK_STYLE
-    m.add_alternative(f'{pre_h}<p><a href="{html.escape(link or "")}" style="{link_style}">'
+    m.add_alternative(f'{dark_head()}{pre_h}<p><a href="{html.escape(link or "")}" class="tbband" style="{link_style}">'
                       f'<font color="#ffffff">{html.escape(title)}</font></a></p>{content}',
                       subtype="html")
     if link:  # set_content() が Content-* ヘッダーを消すので最後に付ける
@@ -306,7 +307,8 @@ def run_mail(cfg, mb):
                 stats["keep"] += 1
                 log(f"- ✅ {frm} / {subj}" + (f"\n  🔗 {url}" if url else ""))
                 if not DRY:
-                    if url:  # 青い帯のリンクを入れて入れ直す(未読などのフラグ・受信日時は引き継ぐ)
+                    if url or (annotate.DARK_MODE != "off" and has_html(raw)):
+                        # 青い帯のリンク・暗い背景のCSSを入れて入れ直す(未読などのフラグ・受信日時は引き継ぐ)
                         typ, _ = im.append(mb.q(keep_folder), flag_str, idate,
                                            annotate_raw(raw, subject=subj, url=url))
                         if typ != "OK":
@@ -378,6 +380,7 @@ def run_purge(cfg, mb):
 # ---------------------------------------------------------------- main
 def main():
     cfg = json.loads((DATA / os.environ.get("CONFIG", "config.json")).read_text(encoding="utf-8"))
+    annotate.DARK_MODE = cfg.get("dark_mode", "auto")  # auto / always / off
     state = load_state()
     pub(f"# 実行ログ {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC" + (" (DRY RUN)" if DRY else ""))
     failed = False
