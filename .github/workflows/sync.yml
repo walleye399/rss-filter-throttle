@@ -10,6 +10,10 @@ on:
         description: "DRY RUN（メールボックスへの書き込み・削除・状態更新なし）"
         type: boolean
         default: true
+      baseline:
+        description: "基準化（RSSを配信せず、今ある記事を取得済みにする。復旧・移行用。dry_run をオフにして実行）"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,7 +25,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -47,6 +51,7 @@ jobs:
           DATA_DIR: ${{ github.workspace }}/data
           QUIET_LOG: "1"   # 公開ログには件数だけ。詳細は data/logs/last_run.md(非公開)
           DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          BASELINE: ${{ github.event.inputs.baseline == 'true' && '1' || '0' }}
           IMAP_HOST: ${{ secrets.IMAP_HOST }}
           IMAP_USER: ${{ secrets.IMAP_USER }}
           IMAP_PASS: ${{ secrets.IMAP_PASS }}
