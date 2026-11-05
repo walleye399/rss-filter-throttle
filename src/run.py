@@ -19,7 +19,10 @@ import imaplib
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import time
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlparse
@@ -37,8 +40,12 @@ ROOT = Path(__file__).resolve().parent.parent          # プログラム(公開�
 DATA = Path(os.environ.get("DATA_DIR", str(ROOT)))   # ルール・feeds.txt・状態・ログ(非公開リポジトリ)
 QUIET = os.environ.get("QUIET_LOG", "0") == "1"      # 1: 公開してよい行(件数など)だけをActionsのログに出す
 DRY = os.environ.get("DRY_RUN", "0") == "1"
+BASELINE = os.environ.get("BASELINE", "0") == "1"  # 1: RSSを配信せず「今ある記事は取得済み」として記録だけする(移行・復旧用)
 STATE_PATH = DATA / "state" / "state.json"
-SEEN_CAP = 500
+SEEN_EXTRA = 300   # フィードから消えた記事のIDを、予備として残す件数（今フィードにある記事のIDは全部残す）
+CONN_ERRORS = (imaplib.IMAP4.abort, ssl.SSLError, OSError, EOFError)
+START = time.monotonic()
+LIMIT = 8 * 60     # 実行時間の上限(秒)。config.json の run_limit_minutes で変更
 UA = "Mozilla/5.0 (compatible; tb-migrate/2.0)"
 detail, public = [], []  # detail: 非公開ログ(logs/last_run.md)用 / public: Actionsのログ・Summary用
 
@@ -65,6 +72,65 @@ def fail(name, e):
 
 
 # ---------------------------------------------------------------- 共通
+class ConnLost(Exception):
+    """再接続しても IMAP サーバーとの接続が回復しなかった。"""
+
+
+def out_of_time():
+    return time.monotonic() - START > LIMIT
+
+
+class Session:
+    """IMAP接続を必要になった時に作り、切れていたら作り直す。"""
+
+    def __init__(self, cfg):
+        self.cfg, self._mb = cfg, None
+
+    @property
+    def mb(self):
+        if self._mb is None:
+            self._mb = imaputil.Mailbox(imaputil.connect(self.cfg["account"]), dry=DRY)
+        return self._mb
+
+    def close(self):
+        if self._mb is not None:
+            try:
+                self._mb.im.logout()
+            except Exception:
+                pass
+            self._mb = None
+
+    def reconnect(self):
+        self.close()
+        return self.mb
+
+    def ensure(self):
+        """放置されて切られていないか確認し、切れていれば再接続する。"""
+        if self._mb is not None:
+            try:
+                self._mb.im.noop()
+            except CONN_ERRORS:
+                self.reconnect()
+        return self.mb
+
+    def append(self, folder, flags, date, data):
+        """APPEND。接続エラーなら1回だけ再接続して再試行、それでも駄目なら ConnLost。"""
+        for attempt in (1, 2):
+            try:
+                mb = self.mb
+                typ, resp = mb.im.append(mb.q(folder), flags, date, data)
+                if typ != "OK":  # 容量超過などサーバーが拒否した場合(これは接続の問題ではない)
+                    raise RuntimeError(f"APPENDが拒否されました: {typ}")
+                return
+            except CONN_ERRORS as e:
+                if attempt == 2:
+                    raise ConnLost(str(e))
+                try:
+                    self.reconnect()
+                except CONN_ERRORS as e2:
+                    raise ConnLost(str(e2))
+
+
 def load_state():
     return json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.exists() else {}
 
@@ -119,6 +185,21 @@ CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
 
+def http_get(url, headers, total=40, maxbytes=15_000_000):
+    """合計 total 秒・maxbytes を超えたら打ち切る取得(少しずつ送られ続けても止まる)。"""
+    t0 = time.monotonic()
+    with requests.get(url, headers=headers, timeout=(10, 15), stream=True) as r:
+        r.raise_for_status()
+        buf = bytearray()
+        for chunk in r.iter_content(65536):
+            buf += chunk
+            if len(buf) > maxbytes:
+                raise RuntimeError("応答が大きすぎます")
+            if time.monotonic() - t0 > total:
+                raise TimeoutError(f"取得に{total}秒を超えました")
+        return bytes(buf)
+
+
 def fetch_browser(url):
     """bot判定でブロックされるサイト用: ブラウザ相当のヘッダー + Chrome風のTLS通信(curl_cffi)。"""
     u = urlparse(url)
@@ -129,11 +210,10 @@ def fetch_browser(url):
     except ImportError:
         creq = None
     if creq:
-        r = creq.get(url, headers=hdr, impersonate="chrome", timeout=25)
-    else:  # curl_cffi が無い場合は通常の requests でヘッダーだけ変える
-        r = requests.get(url, headers={**hdr, "User-Agent": CHROME_UA}, timeout=25)
-    r.raise_for_status()
-    return r.content
+        r = creq.get(url, headers=hdr, impersonate="chrome", timeout=25)  # timeout は全体の上限
+        r.raise_for_status()
+        return r.content
+    return http_get(url, {**hdr, "User-Agent": CHROME_UA})
 
 
 def fetch_feed(url, browser_hosts=()):
@@ -141,12 +221,28 @@ def fetch_feed(url, browser_hosts=()):
         if urlparse(url).hostname in browser_hosts:
             content = fetch_browser(url)
         else:
-            r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
-            r.raise_for_status()
-            content = r.content
+            content = http_get(url, {"User-Agent": UA})
         return url, feedparser.parse(content), None
     except Exception as e:  # 1フィードの失敗で全体を止めない
         return url, None, str(e)
+
+
+def fetch_all(urls, browser_hosts=(), workers=8, phase_limit=150):
+    """全フィードを並列取得。-> [(url, parsed|None, err|None, 所要秒)]。取得フェーズ全体にも上限を設ける。"""
+    out = [None] * len(urls)
+    t_phase = time.monotonic()
+
+    def job(i):
+        t0 = time.monotonic()
+        if t0 - t_phase > phase_limit:
+            out[i] = (urls[i], None, "取得フェーズの時間切れ", 0.0)
+            return
+        u, d, err = fetch_feed(urls[i], browser_hosts)
+        out[i] = (u, d, err, time.monotonic() - t0)
+
+    with cf.ThreadPoolExecutor(workers) as ex:
+        list(ex.map(job, range(len(urls))))
+    return out
 
 
 def entry_dt(e):
@@ -183,7 +279,7 @@ def build_rss_message(e, feed_title, link, reason=None):
     return m, d
 
 
-def run_rss(cfg, mb, state):
+def run_rss(cfg, S, state):
     c = cfg["rss"]
     rulesets = build_rulesets(cfg, c["rulesets"])
     icase = cfg.get("regex_ignore_case", False)
@@ -191,36 +287,61 @@ def run_rss(cfg, mb, state):
     urls = read_feeds(DATA / c["feeds_file"])
     seen = state.setdefault("rss", {}).setdefault("seen", {})
     max_age = dt.timedelta(hours=c.get("first_run_max_age_hours", 24))
+    max_deliver = c.get("max_deliver_per_run", 300)
     now = dt.datetime.now(dt.timezone.utc)
-    pub(f"\n## RSS ({len(urls)}フィード)")
+    pub(f"\n## RSS ({len(urls)}フィード)" + ("（基準化: 配信せず、今ある記事を取得済みにします）" if BASELINE else ""))
 
     stats = {"keep": 0, "reject": 0, "skip_old": 0, "err": 0}
-    with cf.ThreadPoolExecutor(8) as ex:
-        results = list(ex.map(lambda u: fetch_feed(u, tuple(c.get("browser_hosts", []))), urls))
-    for n, (url, d, err) in enumerate(results, 1):
+    # 1) 先に全フィードを取得する(この間、IMAPには接続しない＝放置して切られない)
+    t0 = time.monotonic()
+    results = fetch_all(urls, tuple(c.get("browser_hosts", [])))
+    pub(f"取得: {time.monotonic() - t0:.0f}秒")
+    for n, (url, d, err, secs) in enumerate(results, 1):
+        if secs > 15:
+            log(f"- ⏱ 遅いフィード: {url} ({secs:.0f}秒)")
+            if QUIET:
+                pub(f"- ⏱ feeds.txt の {n} 番目のフィードの取得に {secs:.0f} 秒")
+    delivered, stop = 0, None
+    # 2) 判定して配信する
+    for n, (url, d, err, secs) in enumerate(results, 1):
         if err or d is None:
             stats["err"] += 1
             log(f"- ⚠ 取得失敗: {url} ({err})")
             if QUIET:
                 pub(f"- ⚠ 取得失敗: feeds.txt の {n} 番目のフィード")
             continue
+        if stop:
+            break  # 残りのフィードは記録に触れない(次回そのまま処理される)
         ftitle = d.feed.get("title") or url
         first = url not in seen
         old = seen.get(url, [])
+        old_set = set(old)
         cur_ids, todo = [], []
         for e in d.entries:
             link = e.get("link", "")
             eid = e.get("id") or link or e.get("title", "")
             cur_ids.append(eid)
-            if eid in old:
+            if eid in old_set:
                 continue
             ed = entry_dt(e)
             if first and ed and now - ed > max_age:
                 stats["skip_old"] += 1
                 continue
             todo.append((ed or now, eid, e, link))
-        done = []
+        if BASELINE:
+            if not DRY:
+                seen[url] = list(dict.fromkeys(cur_ids))
+                save_state(state)
+            stats["skip_old"] += len(todo)
+            continue
+        done = set()
         for _, eid, e, link in sorted(todo, key=lambda x: x[0]):
+            if out_of_time():
+                stop = "実行時間の上限に達したため、残りは次回に回します"
+            elif delivered >= max_deliver:
+                stop = f"1回の配信上限({max_deliver}件)に達したため、残りは次回に回します"
+            if stop:
+                break
             title = html.unescape(e.get("title", ""))
             body_fn = lambda e=e: strip_html((e.get("content") or [{}])[0].get("value", "")
                                              or e.get("summary", ""))
@@ -230,31 +351,47 @@ def run_rss(cfg, mb, state):
             try:
                 if r["result"] == "keep":
                     if not DRY:
+                        if not delivered:
+                            S.ensure()
                         m, mdt = build_rss_message(e, ftitle, link)
-                        mb.im.append(mb.q(keep_folder), None,
-                                     imaplib.Time2Internaldate(mdt.timestamp()), m.as_bytes())
+                        S.append(keep_folder, None, imaplib.Time2Internaldate(mdt.timestamp()), m.as_bytes())
                     stats["keep"] += 1
                     log(f"- ✅ [{ftitle}] {title}")
                 else:
                     if not DRY:
+                        if not delivered:
+                            S.ensure()
                         m, _ = build_rss_message(e, ftitle, link, r["reason"])
                         # 日付は付けない = 追加した時刻が保管期限の起点になる
-                        mb.im.append(mb.q(r["folder"]), r"(\Seen)", None, m.as_bytes())
+                        S.append(r["folder"], r"(\Seen)", None, m.as_bytes())
                     stats["reject"] += 1
                     log(f"- 🚫 [{ftitle}] {title} → {r['folder']} ← {r['reason']} (フィルタ{r['tag']})")
-                done.append(eid)
+                done.add(eid)
+                delivered += 1
+            except ConnLost as ex_:
+                stats["err"] += 1
+                log(f"- ⚠ 接続が回復しないため中断: {ex_}")
+                stop = "メールサーバーとの接続が切れたため、残りは次回に回します"
+                break
             except Exception as ex_:
                 stats["err"] += 1
                 log(f"- ⚠ 配信失敗(次回再試行): {title} ({ex_})")
         if not DRY:
-            merged = done + [i for i in cur_ids if i not in done]
-            merged += [i for i in old if i not in merged]
-            seen[url] = merged[:SEEN_CAP]
+            # 配信できなかった記事は「処理済み」にしない。フィードに今ある記事のIDは切り詰めずに全部残す
+            pending = {eid for _, eid, _, _ in todo} - done
+            cur = list(dict.fromkeys(cur_ids))
+            cur_set = set(cur)
+            seen[url] = [i for i in cur if i not in pending] + \
+                        [i for i in old if i not in cur_set and i not in pending][:SEEN_EXTRA]
+            save_state(state)  # フィードごとに保存(途中で止まっても進捗が残る)
+    if stop:
+        pub(f"⏱ {stop}")
     pub(f"\n結果: 残す {stats['keep']} / 除外 {stats['reject']} / 初回スキップ(古い) {stats['skip_old']} / エラー {stats['err']}")
 
 
 # ---------------------------------------------------------------- メール
-def run_mail(cfg, mb):
+def run_mail(cfg, S):
+    mb = S.ensure()
     c = cfg["mail"]
     rulesets = build_rulesets(cfg, c["rulesets"])
     icase = cfg.get("regex_ignore_case", False)
@@ -269,6 +406,9 @@ def run_mail(cfg, mb):
     stats = {"keep": 0, "reject": 0, "err": 0}
     changed = False
     for u in uids:
+        if out_of_time():
+            pub("⏱ 実行時間の上限に達したため、残りは次回に回します")
+            break
         uid = u.decode()
         typ, d = im.uid("FETCH", uid, "(FLAGS INTERNALDATE BODY.PEEK[])")
         if typ != "OK" or not d or not isinstance(d[0], tuple):
@@ -334,6 +474,11 @@ def run_mail(cfg, mb):
                         raise RuntimeError("APPEND失敗")
                     im.uid("STORE", uid, "+FLAGS.SILENT", r"(\Deleted)")
                     changed = True
+        except CONN_ERRORS as ex_:
+            stats["err"] += 1
+            log(f"  ⚠ 接続が切れたため中断: {ex_}")
+            pub("⚠ メールサーバーとの接続が切れたため、残りは次回に回します")
+            break
         except Exception as ex_:
             stats["err"] += 1
             log(f"  ⚠ 移動失敗(次回再試行): {ex_}")
@@ -343,7 +488,8 @@ def run_mail(cfg, mb):
 
 
 # ---------------------------------------------------------------- 後片付け
-def run_purge(cfg, mb):
+def run_purge(cfg, S):
+    mb = S.ensure()
     hours = cfg.get("retention_hours", 24)
     folders = set()
     for rs in cfg["rulesets"].values():
@@ -384,14 +530,15 @@ def main():
     state = load_state()
     pub(f"# 実行ログ {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC" + (" (DRY RUN)" if DRY else ""))
     failed = False
-    im = imaputil.connect(cfg["account"])
-    mb = imaputil.Mailbox(im, dry=DRY)
+    global LIMIT
+    LIMIT = cfg.get("run_limit_minutes", 8) * 60
+    S = Session(cfg)
     steps = []
+    if cfg.get("mail"):  # 件数が少なく急ぐメールを先に処理する
+        steps.append(("メール", lambda: run_mail(cfg, S)))
     if cfg.get("rss"):
-        steps.append(("RSS", lambda: run_rss(cfg, mb, state)))
-    if cfg.get("mail"):
-        steps.append(("メール", lambda: run_mail(cfg, mb)))
-    steps.append(("掃除", lambda: run_purge(cfg, mb)))
+        steps.append(("RSS", lambda: run_rss(cfg, S, state)))
+    steps.append(("掃除", lambda: run_purge(cfg, S)))
     for name, fn in steps:
         try:
             fn()
@@ -399,10 +546,7 @@ def main():
             failed = True
             fail(name, e)
     save_state(state)
-    try:
-        im.logout()
-    except Exception:
-        pass
+    S.close()
     sp = os.environ.get("GITHUB_STEP_SUMMARY")
     if sp:
         Path(sp).write_text("\n".join(public) + "\n", encoding="utf-8")
