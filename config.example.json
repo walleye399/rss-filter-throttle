@@ -1,0 +1,42 @@
+{
+  "regex_ignore_case": true,
+  "retention_hours": 24,
+  "processed_folder": "N_ProcessedNewsletters",
+  "account": {
+    "host_env": "IMAP_HOST",
+    "user_env": "IMAP_USER",
+    "pass_env": "IMAP_PASS",
+    "port": 993
+  },
+  "rulesets": {
+    "a": {
+      "file": "rules/rules_a.json",
+      "default_reject": "X_Excluded",
+      "by_label": {}
+    },
+    "b": {
+      "file": "rules/rules_b.json",
+      "default_reject": "X_Excluded",
+      "by_label": {
+        "Sent": "B_ExcludedBlogs"
+      }
+    }
+  },
+  "rss": {
+    "feeds_file": "feeds.txt",
+    "rulesets": [
+      "a",
+      "b"
+    ],
+    "first_run_max_age_hours": 24,
+    "browser_hosts": [],
+    "max_deliver_per_run": 300
+  },
+  "mail": {
+    "source_folder": "INBOX",
+    "rulesets": [
+      "a"
+    ]
+  },
+  "run_limit_minutes": 8
+}
