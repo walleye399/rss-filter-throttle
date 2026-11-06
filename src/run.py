@@ -47,9 +47,8 @@ STATE_PATH = DATA / "state" / "state.json"
 SEEN_EXTRA = 300   # フィードから消えた記事のIDを、予備として残す件数（今フィードにある記事のIDは全部残す）
 CONN_ERRORS = (imaplib.IMAP4.abort, ssl.SSLError, OSError, EOFError)
 START = time.monotonic()
-LIMIT = 8 * 60     # 実行時間の上限(秒)。config.json の run_limit_minutes で変更
+LIMIT = 25 * 60    # 実行時間の上限(秒)。config.json の run_limit_minutes で変更
 JOB_LIMIT = 60     # 1フィードの取得+解析に使える上限(秒)。超えたらそのフィードの処理を強制終了する
-PHASE_LIMIT = 150  # 全フィード取得フェーズの上限(秒)
 UA = "Mozilla/5.0 (compatible; tb-migrate/2.0)"
 detail, public = [], []  # detail: 非公開ログ(logs/last_run.md)用 / public: Actionsのログ・Summary用
 
@@ -182,12 +181,14 @@ def build_rulesets(cfg, names):
 
 # ---------------------------------------------------------------- RSS
 def read_feeds(path):
-    urls = []
+    """feeds.txt -> [(url, {オプション})]。行末の「@browser」は、ブラウザ風の取得にする印。"""
+    feeds = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if s and not s.startswith("#"):
-            urls.append(s)
-    return urls
+            tok = s.split()
+            feeds.append((tok[0], {t.lstrip("@").lower() for t in tok[1:] if t.startswith("@")}))
+    return feeds
 
 
 CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -225,9 +226,9 @@ def fetch_browser(url):
     return http_get(url, {**hdr, "User-Agent": CHROME_UA})
 
 
-def fetch_feed(url, browser_hosts=()):
+def fetch_feed(url, browser=False):
     try:
-        if urlparse(url).hostname in browser_hosts:
+        if browser:
             content = fetch_browser(url)
         else:
             content = http_get(url, {"User-Agent": UA})
@@ -250,9 +251,9 @@ def extract(d):
     return {"title": d.feed.get("title"), "entries": ents}
 
 
-def _worker(url, hosts, conn):
+def _worker(url, browser, conn):
     try:
-        u, d, err = fetch_feed(url, hosts)
+        u, d, err = fetch_feed(url, browser)
         conn.send(("err", err) if err or d is None else ("ok", extract(d)))
     except BaseException as e:  # noqa: BLE001
         try:
@@ -263,55 +264,37 @@ def _worker(url, hosts, conn):
         conn.close()
 
 
-def fetch_all(urls, browser_hosts=(), workers=8):
-    """全フィードを並列取得。各フィードは別プロセスで実行し、止まったら強制終了する
-    (DNS・TLS・応答の遅延・巨大/不正なXMLの解析など、どこで止まっても全体は止まらない)。
-    -> [(url, {'title','entries'} | None, err | None, 所要秒)]"""
+def fetch_killable(url, browser=False):
+    """1フィードを別プロセスで取得・解析し、JOB_LIMIT 秒で強制終了する。
+    DNS・TLS・応答の遅延・巨大/不正なXMLの解析など、どこで止まっても呼び出し元は止まらない。
+    -> ({'title','entries'} | None, err | None, 所要秒)"""
     ctx = mp.get_context("fork")
-    out, queue, running = [None] * len(urls), list(range(len(urls))), {}
-    t_phase = time.monotonic()
-
-    def finish(i, res, t0):
-        out[i] = (urls[i], res[0], res[1], time.monotonic() - t0)
-
-    while queue or running:
-        now = time.monotonic()
-        if now - t_phase > PHASE_LIMIT and queue:
-            for i in queue:
-                out[i] = (urls[i], None, "取得フェーズの時間切れ", 0.0)
-            queue = []
-        while queue and len(running) < workers:
-            i = queue.pop(0)
-            parent, child = ctx.Pipe(duplex=False)
-            p = ctx.Process(target=_worker, args=(urls[i], tuple(browser_hosts), child), daemon=True)
-            p.start()
-            child.close()
-            running[i] = (p, parent, time.monotonic())
-        for i, (p, conn, t0) in list(running.items()):
-            res = None
-            if conn.poll():
-                try:
-                    kind, payload = conn.recv()
-                    res = (payload, None) if kind == "ok" else (None, payload)
-                except EOFError:
-                    res = (None, "取得プロセスが異常終了しました")
-            elif not p.is_alive() and not conn.poll():
+    parent, child = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=_worker, args=(url, browser, child), daemon=True)
+    t0 = time.monotonic()
+    p.start()
+    child.close()
+    res = None
+    while res is None:
+        if parent.poll(0.1):
+            try:
+                kind, payload = parent.recv()
+                res = (payload, None) if kind == "ok" else (None, payload)
+            except EOFError:
                 res = (None, "取得プロセスが異常終了しました")
-            elif time.monotonic() - t0 > JOB_LIMIT:
-                res = (None, f"{JOB_LIMIT}秒で打ち切りました(取得または解析が終わらない)")
-            if res is not None:
-                if p.is_alive():
-                    p.terminate()
-                    p.join(2)
-                    if p.is_alive():
-                        p.kill()
-                else:
-                    p.join(1)
-                conn.close()
-                finish(i, res, t0)
-                del running[i]
-        time.sleep(0.05)
-    return out
+        elif not p.is_alive() and not parent.poll():
+            res = (None, "取得プロセスが異常終了しました")
+        elif time.monotonic() - t0 > JOB_LIMIT:
+            res = (None, f"{JOB_LIMIT}秒で打ち切りました(取得または解析が終わらない)")
+    if p.is_alive():
+        p.terminate()
+        p.join(2)
+        if p.is_alive():
+            p.kill()
+    else:
+        p.join(1)
+    parent.close()
+    return res[0], res[1], time.monotonic() - t0
 
 
 def entry_dt(e):
@@ -353,34 +336,34 @@ def run_rss(cfg, S, state):
     rulesets = build_rulesets(cfg, c["rulesets"])
     icase = cfg.get("regex_ignore_case", False)
     keep_folder = cfg["processed_folder"]
-    urls = read_feeds(DATA / c["feeds_file"])
+    feeds = read_feeds(DATA / c["feeds_file"])
+    bhosts = set(c.get("browser_hosts", []))
     seen = state.setdefault("rss", {}).setdefault("seen", {})
     max_age = dt.timedelta(hours=c.get("first_run_max_age_hours", 24))
     max_deliver = c.get("max_deliver_per_run", 300)
+    # 分散実行: フィードの取得開始を feed_interval 秒ずつ、同じサイトは host_interval 秒ずつ空ける
+    feed_int, host_int = c.get("feed_interval_seconds", 20), c.get("host_interval_seconds", 90)
+    if DRY or BASELINE:  # 確認・復旧用の実行は、待たずに一気に処理する
+        feed_int = host_int = 0
     now = dt.datetime.now(dt.timezone.utc)
-    pub(f"\n## RSS ({len(urls)}フィード)" + ("（基準化: 配信せず、今ある記事を取得済みにします）" if BASELINE else ""))
+    pub(f"\n## RSS ({len(feeds)}フィード)" + ("（基準化: 配信せず、今ある記事を取得済みにします）" if BASELINE else ""))
 
     stats = {"keep": 0, "reject": 0, "skip_old": 0, "err": 0}
-    # 1) 先に全フィードを取得する(この間、IMAPには接続しない＝放置して切られない)
-    t0 = time.monotonic()
-    results = fetch_all(urls, tuple(c.get("browser_hosts", [])))
-    pub(f"取得: {time.monotonic() - t0:.0f}秒")
-    for n, (url, d, err, secs) in enumerate(results, 1):
+    delivered, stop = 0, None
+    t_rss = time.monotonic()
+
+    def process(n, url, d, err, secs, browser):
+        nonlocal delivered, stop
         if secs > 15:
             log(f"- ⏱ 遅いフィード: {url} ({secs:.0f}秒)")
             if QUIET:
-                pub(f"- ⏱ feeds.txt の {n} 番目のフィードの取得に {secs:.0f} 秒")
-    delivered, stop = 0, None
-    # 2) 判定して配信する
-    for n, (url, d, err, secs) in enumerate(results, 1):
+                pub(f"- ⏱ feeds.txt の {n} 番目のフィードの取得に {secs:.0f} 秒" + ("（ブラウザ風）" if browser else ""))
         if err or d is None:
             stats["err"] += 1
             log(f"- ⚠ 取得失敗: {url} ({err})")
             if QUIET:
                 pub(f"- ⚠ 取得失敗: feeds.txt の {n} 番目のフィード" + (" (時間切れ)" if re.search("打ち切り|時間切れ", str(err)) else ""))
-            continue
-        if stop:
-            break  # 残りのフィードは記録に触れない(次回そのまま処理される)
+            return
         ftitle = d.get("title") or url
         first = url not in seen
         old = seen.get(url, [])
@@ -402,8 +385,8 @@ def run_rss(cfg, S, state):
                 seen[url] = list(dict.fromkeys(cur_ids))
                 save_state(state)
             stats["skip_old"] += len(todo)
-            continue
-        done = set()
+            return
+        done, ensured = set(), False
         for _, eid, e, link in sorted(todo, key=lambda x: x[0]):
             if out_of_time():
                 stop = "実行時間の上限に達したため、残りは次回に回します"
@@ -418,18 +401,17 @@ def run_rss(cfg, S, state):
                       content_base=link, body=body_fn)
             r = evaluate_chain(rulesets, msg, icase)
             try:
+                if not DRY and not ensured:
+                    S.ensure()  # 取得の合間に接続が切られていないか確認(切れていれば再接続)
+                    ensured = True
                 if r["result"] == "keep":
                     if not DRY:
-                        if not delivered:
-                            S.ensure()
                         m, mdt = build_rss_message(e, ftitle, link)
                         S.append(keep_folder, None, imaplib.Time2Internaldate(mdt.timestamp()), m.as_bytes())
                     stats["keep"] += 1
                     log(f"- ✅ [{ftitle}] {title}")
                 else:
                     if not DRY:
-                        if not delivered:
-                            S.ensure()
                         m, _ = build_rss_message(e, ftitle, link, r["reason"])
                         # 日付は付けない = 追加した時刻が保管期限の起点になる
                         S.append(r["folder"], r"(\Seen)", None, m.as_bytes())
@@ -453,9 +435,31 @@ def run_rss(cfg, S, state):
             seen[url] = [i for i in cur if i not in pending] + \
                         [i for i in old if i not in cur_set and i not in pending][:SEEN_EXTRA]
             save_state(state)  # フィードごとに保存(途中で止まっても進捗が残る)
+
+    # 取得開始が最も早く許される(=同じサイトを連続させない)フィードから順に処理する
+    pending_idx = list(range(len(feeds)))
+    host_of = lambda i: urlparse(feeds[i][0]).hostname
+    last_start, host_last = None, {}
+    allowed = lambda i: max(host_last.get(host_of(i), -1e9) + host_int,
+                            (last_start + feed_int) if last_start is not None else -1e9)
+    while pending_idx and not stop:
+        i = min(pending_idx, key=lambda k: (allowed(k), k))
+        pending_idx.remove(i)
+        while time.monotonic() < allowed(i) and not out_of_time():
+            time.sleep(min(1.0, max(0.0, allowed(i) - time.monotonic())))
+        if out_of_time():
+            stop = "実行時間の上限に達したため、残りは次回に回します"
+            break
+        url, opts = feeds[i]
+        browser = "browser" in opts or urlparse(url).hostname in bhosts
+        last_start = time.monotonic()
+        host_last[host_of(i)] = last_start
+        d, err, secs = fetch_killable(url, browser)
+        process(i + 1, url, d, err, secs, browser)
     if stop:
         pub(f"⏱ {stop}")
-    pub(f"\n結果: 残す {stats['keep']} / 除外 {stats['reject']} / 初回スキップ(古い) {stats['skip_old']} / エラー {stats['err']}")
+    pub(f"\nRSSの処理時間: {time.monotonic() - t_rss:.0f}秒")
+    pub(f"結果: 残す {stats['keep']} / 除外 {stats['reject']} / 初回スキップ(古い) {stats['skip_old']} / エラー {stats['err']}")
 
 
 # ---------------------------------------------------------------- メール
@@ -600,7 +604,7 @@ def main():
     pub(f"# 実行ログ {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC" + (" (DRY RUN)" if DRY else ""))
     failed = False
     global LIMIT, JOB_LIMIT
-    LIMIT = cfg.get("run_limit_minutes", 8) * 60
+    LIMIT = cfg.get("run_limit_minutes", 25) * 60
     JOB_LIMIT = (cfg.get("rss") or {}).get("feed_timeout_seconds", 60)
     # 想定外の場所で止まっても、上限+2分で必ず終了する。終了時に「どこで止まっていたか」(スタックトレース)を公開ログに出す
     faulthandler.dump_traceback_later(int(LIMIT) + 120, exit=True)
@@ -608,9 +612,9 @@ def main():
     steps = []
     if cfg.get("mail"):  # 件数が少なく急ぐメールを先に処理する
         steps.append(("メール", lambda: run_mail(cfg, S)))
-    if cfg.get("rss"):
-        steps.append(("RSS", lambda: run_rss(cfg, S, state)))
     steps.append(("掃除", lambda: run_purge(cfg, S)))
+    if cfg.get("rss"):  # 時間のかかるRSSは最後
+        steps.append(("RSS", lambda: run_rss(cfg, S, state)))
     for name, fn in steps:
         try:
             fn()
