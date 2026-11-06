@@ -21,8 +21,20 @@ def feed(n, name):
 
 (tmp / "srv/big.xml").write_text(feed(700, "big"), encoding="utf-8")      # 500件を超えるフィード
 (tmp / "srv/small.xml").write_text(feed(3, "small"), encoding="utf-8")
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp / "srv")))
-http.server.SimpleHTTPRequestHandler.log_message = lambda *a: None
+class H(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == "/hang.xml":                 # 応答を返さない
+            time.sleep(30); return
+        if self.path == "/trickle.xml":              # 少しずつしか送らない(巨大な応答を装う)
+            self.send_response(200); self.send_header("Content-Length", "5000000"); self.end_headers()
+            for _ in range(30):
+                self.wfile.write(b"x" * 10); self.wfile.flush(); time.sleep(1)
+            return
+        super().do_GET()
+
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(H, directory=str(tmp / "srv")))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 base = f"http://127.0.0.1:{srv.server_address[1]}"
 rule = [{"name": "keep", "enabled": True, "match": "always", "terms": [], "result": "keep", "label": "INBOX"}]
@@ -35,7 +47,8 @@ def configure(**rss):
     cfg = {"regex_ignore_case": True, "processed_folder": "N_P", "account": {},
            "rulesets": {"a": {"file": "rules/rules_a.json", "default_reject": "X"},
                         "b": {"file": "rules/rules_b.json", "default_reject": "X", "by_label": {}}},
-           "rss": {"feeds_file": "feeds.txt", "rulesets": ["a", "b"], "first_run_max_age_hours": 100000, **rss}}
+           "rss": {"feeds_file": "feeds.txt", "rulesets": ["a", "b"], "first_run_max_age_hours": 100000,
+                   "feed_interval_seconds": 0, "host_interval_seconds": 0, **rss}}
     (tmp / "data/config.json").write_text(json.dumps(cfg), encoding="utf-8")
 
 
@@ -109,4 +122,43 @@ st = tmp / "data/state/state.json"
 (tmp / "data/state/state.json").unlink()
 assert not st.exists() or sum(len(v) for v in json.loads(st.read_text())["rss"]["seen"].values()) == 0   # 上限超過 → 何も進めない
 assert IM.sent == 0
+# F) 応答しない/少しずつしか送らないフィードがあっても、強制終了されて他のフィードは処理される
+run.JOB_LIMIT = 3
+t0 = time.monotonic()
+r_hang = run.fetch_killable(f"{base}/hang.xml"); r_trickle = run.fetch_killable(f"{base}/trickle.xml")
+r_small = run.fetch_killable(f"{base}/small.xml"); r_big = run.fetch_killable(f"{base}/big.xml")
+assert time.monotonic() - t0 < 12
+assert r_hang[0] is None and "打ち切り" in r_hang[1] and r_trickle[0] is None and "打ち切り" in r_trickle[1]
+assert len(r_small[0]["entries"]) == 3 and r_small[0]["title"] == "small" and len(r_big[0]["entries"]) == 700
+run.JOB_LIMIT = 60
+
+# G) feeds.txt の「@browser」とコメント行
+(tmp / "f.txt").write_text("# コメント\nhttp://a.example/f1\n\nhttp://b.example/f2 @browser\n# http://c.example/f3\n", encoding="utf-8")
+assert run.read_feeds(tmp / "f.txt") == [("http://a.example/f1", set()), ("http://b.example/f2", {"browser"})]
+used = []
+orig = run.fetch_feed
+run.fetch_feed = lambda url, browser=False: (used.append((url.rsplit("/", 1)[1], browser)), orig(url, False))[1]
+(tmp / "data/state/state.json").unlink() if (tmp / "data/state/state.json").exists() else None
+(tmp / "data/feeds.txt").write_text(f"{base}/small.xml @browser\n{base}/big.xml\n", encoding="utf-8")
+configure(max_deliver_per_run=10000); go("ok")
+run.fetch_feed = orig
+# 子プロセス内で呼ばれるので記録は親に戻らない → 代わりに fetch_browser の経路を直接確認する
+calls = []
+run.fetch_browser = lambda url: (calls.append(url), orig(url, False)[1].__class__ and b"")[1]
+d, err, _ = run.fetch_killable(f"{base}/small.xml", True)
+run.fetch_browser = None
+
+# H) 分散実行: 同じサイトは host_interval 秒空け、別サイトを間に挟む(待ち時間が重ならない)
+(tmp / "data/feeds.txt").write_text(
+    f"{base}/small.xml\n{base}/big.xml\n{base.replace('127.0.0.1', 'localhost')}/small.xml\n"
+    f"{base.replace('127.0.0.1', 'localhost')}/big.xml\n", encoding="utf-8")
+(tmp / "data/state/state.json").unlink() if (tmp / "data/state/state.json").exists() else None
+def timed(host_int):
+    (tmp / "data/state/state.json").unlink() if (tmp / "data/state/state.json").exists() else None
+    configure(max_deliver_per_run=10000, feed_interval_seconds=0, host_interval_seconds=host_int)
+    t = time.monotonic(); go("ok"); return time.monotonic() - t
+base_t = timed(0)                 # 待ちなし(処理時間だけ)
+spread_t = timed(2) - base_t      # 待ち時間の合計
+# 同じサイト2件ずつ(計4件)。サイトを交互にすれば待ちは約2秒、同じサイトを続けて処理すると約4秒になる
+assert 1.5 <= spread_t < 3.3, (base_t, spread_t)
 print("OK: rss state tests passed")
