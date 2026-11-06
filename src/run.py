@@ -13,10 +13,12 @@ import datetime as dt
 import email
 import email.header
 import email.utils
+import faulthandler
 import hashlib
 import html
 import imaplib
 import json
+import multiprocessing as mp
 import os
 import re
 import socket
@@ -46,6 +48,8 @@ SEEN_EXTRA = 300   # フィードから消えた記事のIDを、予備として
 CONN_ERRORS = (imaplib.IMAP4.abort, ssl.SSLError, OSError, EOFError)
 START = time.monotonic()
 LIMIT = 8 * 60     # 実行時間の上限(秒)。config.json の run_limit_minutes で変更
+JOB_LIMIT = 60     # 1フィードの取得+解析に使える上限(秒)。超えたらそのフィードの処理を強制終了する
+PHASE_LIMIT = 150  # 全フィード取得フェーズの上限(秒)
 UA = "Mozilla/5.0 (compatible; tb-migrate/2.0)"
 detail, public = [], []  # detail: 非公開ログ(logs/last_run.md)用 / public: Actionsのログ・Summary用
 
@@ -129,6 +133,11 @@ class Session:
                     self.reconnect()
                 except CONN_ERRORS as e2:
                     raise ConnLost(str(e2))
+
+
+def write_log():
+    (DATA / "logs").mkdir(exist_ok=True)  # 詳細ログは非公開リポジトリ側に残す
+    (DATA / "logs" / "last_run.md").write_text("\n".join(detail) + "\n", encoding="utf-8")
 
 
 def load_state():
@@ -227,21 +236,81 @@ def fetch_feed(url, browser_hosts=()):
         return url, None, str(e)
 
 
-def fetch_all(urls, browser_hosts=(), workers=8, phase_limit=150):
-    """全フィードを並列取得。-> [(url, parsed|None, err|None, 所要秒)]。取得フェーズ全体にも上限を設ける。"""
-    out = [None] * len(urls)
+def extract(d):
+    """feedparser の結果から、使う項目だけを取り出した単純な辞書にする(別プロセスから受け渡せる形)。"""
+    ents = []
+    for e in d.entries:
+        ents.append({
+            "title": e.get("title", ""), "link": e.get("link", ""), "id": e.get("id"),
+            "author": e.get("author"), "summary": e.get("summary", ""),
+            "content": [{"value": c.get("value", "")} for c in (e.get("content") or [])][:1],
+            "published_parsed": tuple(e["published_parsed"]) if e.get("published_parsed") else None,
+            "updated_parsed": tuple(e["updated_parsed"]) if e.get("updated_parsed") else None,
+        })
+    return {"title": d.feed.get("title"), "entries": ents}
+
+
+def _worker(url, hosts, conn):
+    try:
+        u, d, err = fetch_feed(url, hosts)
+        conn.send(("err", err) if err or d is None else ("ok", extract(d)))
+    except BaseException as e:  # noqa: BLE001
+        try:
+            conn.send(("err", repr(e)))
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def fetch_all(urls, browser_hosts=(), workers=8):
+    """全フィードを並列取得。各フィードは別プロセスで実行し、止まったら強制終了する
+    (DNS・TLS・応答の遅延・巨大/不正なXMLの解析など、どこで止まっても全体は止まらない)。
+    -> [(url, {'title','entries'} | None, err | None, 所要秒)]"""
+    ctx = mp.get_context("fork")
+    out, queue, running = [None] * len(urls), list(range(len(urls))), {}
     t_phase = time.monotonic()
 
-    def job(i):
-        t0 = time.monotonic()
-        if t0 - t_phase > phase_limit:
-            out[i] = (urls[i], None, "取得フェーズの時間切れ", 0.0)
-            return
-        u, d, err = fetch_feed(urls[i], browser_hosts)
-        out[i] = (u, d, err, time.monotonic() - t0)
+    def finish(i, res, t0):
+        out[i] = (urls[i], res[0], res[1], time.monotonic() - t0)
 
-    with cf.ThreadPoolExecutor(workers) as ex:
-        list(ex.map(job, range(len(urls))))
+    while queue or running:
+        now = time.monotonic()
+        if now - t_phase > PHASE_LIMIT and queue:
+            for i in queue:
+                out[i] = (urls[i], None, "取得フェーズの時間切れ", 0.0)
+            queue = []
+        while queue and len(running) < workers:
+            i = queue.pop(0)
+            parent, child = ctx.Pipe(duplex=False)
+            p = ctx.Process(target=_worker, args=(urls[i], tuple(browser_hosts), child), daemon=True)
+            p.start()
+            child.close()
+            running[i] = (p, parent, time.monotonic())
+        for i, (p, conn, t0) in list(running.items()):
+            res = None
+            if conn.poll():
+                try:
+                    kind, payload = conn.recv()
+                    res = (payload, None) if kind == "ok" else (None, payload)
+                except EOFError:
+                    res = (None, "取得プロセスが異常終了しました")
+            elif not p.is_alive() and not conn.poll():
+                res = (None, "取得プロセスが異常終了しました")
+            elif time.monotonic() - t0 > JOB_LIMIT:
+                res = (None, f"{JOB_LIMIT}秒で打ち切りました(取得または解析が終わらない)")
+            if res is not None:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(2)
+                    if p.is_alive():
+                        p.kill()
+                else:
+                    p.join(1)
+                conn.close()
+                finish(i, res, t0)
+                del running[i]
+        time.sleep(0.05)
     return out
 
 
@@ -308,16 +377,16 @@ def run_rss(cfg, S, state):
             stats["err"] += 1
             log(f"- ⚠ 取得失敗: {url} ({err})")
             if QUIET:
-                pub(f"- ⚠ 取得失敗: feeds.txt の {n} 番目のフィード")
+                pub(f"- ⚠ 取得失敗: feeds.txt の {n} 番目のフィード" + (" (時間切れ)" if re.search("打ち切り|時間切れ", str(err)) else ""))
             continue
         if stop:
             break  # 残りのフィードは記録に触れない(次回そのまま処理される)
-        ftitle = d.feed.get("title") or url
+        ftitle = d.get("title") or url
         first = url not in seen
         old = seen.get(url, [])
         old_set = set(old)
         cur_ids, todo = [], []
-        for e in d.entries:
+        for e in d["entries"]:
             link = e.get("link", "")
             eid = e.get("id") or link or e.get("title", "")
             cur_ids.append(eid)
@@ -530,8 +599,11 @@ def main():
     state = load_state()
     pub(f"# 実行ログ {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC" + (" (DRY RUN)" if DRY else ""))
     failed = False
-    global LIMIT
+    global LIMIT, JOB_LIMIT
     LIMIT = cfg.get("run_limit_minutes", 8) * 60
+    JOB_LIMIT = (cfg.get("rss") or {}).get("feed_timeout_seconds", 60)
+    # 想定外の場所で止まっても、上限+2分で必ず終了する。終了時に「どこで止まっていたか」(スタックトレース)を公開ログに出す
+    faulthandler.dump_traceback_later(int(LIMIT) + 120, exit=True)
     S = Session(cfg)
     steps = []
     if cfg.get("mail"):  # 件数が少なく急ぐメールを先に処理する
@@ -545,13 +617,14 @@ def main():
         except Exception as e:
             failed = True
             fail(name, e)
+        write_log()
     save_state(state)
     S.close()
+    faulthandler.cancel_dump_traceback_later()
     sp = os.environ.get("GITHUB_STEP_SUMMARY")
     if sp:
         Path(sp).write_text("\n".join(public) + "\n", encoding="utf-8")
-    (DATA / "logs").mkdir(exist_ok=True)  # 詳細ログは非公開リポジトリ側に残す
-    (DATA / "logs" / "last_run.md").write_text("\n".join(detail) + "\n", encoding="utf-8")
+    write_log()
     sys.exit(1 if failed else 0)
 
 
