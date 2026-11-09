@@ -122,6 +122,11 @@ st = tmp / "data/state/state.json"
 (tmp / "data/state/state.json").unlink()
 assert not st.exists() or sum(len(v) for v in json.loads(st.read_text())["rss"]["seen"].values()) == 0   # 上限超過 → 何も進めない
 assert IM.sent == 0
+# 改行を含むタイトル・著者・リンク・除外理由でも、メッセージを作れる(ヘッダーに改行は入れられない)
+m, _ = run.build_rss_message({"title": "ユネスコ\n無形文化遺産\r\n  公演", "link": "http://x/1\n", "id": "1", "summary": "s", "author": "著\n者"},
+                             "フィード\n名", "http://x/1\n", "ルール：語1 |\n語2")
+assert m["Subject"] == "ユネスコ 無形文化遺産 公演" and m["X-Exclusion-Reason"] == "ルール：語1 | 語2" and m["Content-Base"] == "http://x/1"
+m.as_bytes()
 # F) 応答しない/少しずつしか送らないフィードがあっても、強制終了されて他のフィードは処理される
 run.JOB_LIMIT = 3
 t0 = time.monotonic()
