@@ -193,6 +193,6 @@ def evaluate_chain(rulesets, msg: Msg, icase=False):
         if d["result"] == "reject":
             d["tag"] = rs["tag"]
             d["folder"] = rs.get("by_label", {}).get(d["label"], rs["default_reject"])
-            d["reason"] = f"{d['rule']}：" + " | ".join(d["hits"])
+            d["reason"] = " ".join((f"{d['rule']}：" + " | ".join(d["hits"])).split())
             return d
     return {"result": "keep", "folder": None, "reason": "", "tag": None, "rule": None, "hits": []}

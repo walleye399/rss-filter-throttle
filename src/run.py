@@ -165,6 +165,11 @@ def dh(v):
         return v
 
 
+def oneline(s):
+    """改行・連続する空白を1つの空白にまとめる。メールのヘッダーに改行は入れられないため。"""
+    return " ".join(str(s or "").split())
+
+
 def strip_html(s):
     return html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
 
@@ -303,8 +308,9 @@ def entry_dt(e):
 
 
 def build_rss_message(e, feed_title, link, reason=None):
-    title = html.unescape(e.get("title", "") or "(無題)")
-    author = e.get("author") or feed_title
+    title = oneline(html.unescape(e.get("title", ""))) or "(無題)"
+    feed_title, link, reason = oneline(feed_title), oneline(link), oneline(reason) if reason else reason
+    author = oneline(e.get("author")) or feed_title
     content = (e["content"][0].get("value", "") if e.get("content") else "") or e.get("summary", "")
     eid = e.get("id") or link or title
     m = EmailMessage()
@@ -394,7 +400,7 @@ def run_rss(cfg, S, state):
                 stop = f"1回の配信上限({max_deliver}件)に達したため、残りは次回に回します"
             if stop:
                 break
-            title = html.unescape(e.get("title", ""))
+            title = oneline(html.unescape(e.get("title", "")))  # Thunderbirdと同様、件名の改行は空白にして判定する
             body_fn = lambda e=e: strip_html((e.get("content") or [{}])[0].get("value", "")
                                              or e.get("summary", ""))
             msg = Msg(subject=title, from_=f"{ftitle} {e.get('author', '')}",
